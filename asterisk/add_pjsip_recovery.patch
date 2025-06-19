@@ -1,0 +1,434 @@
+diff --git a/res/res_pjsip_session.c b/res/res_pjsip_session.c
+index db5bdd1202..5a882df47c 100644
+--- a/res/res_pjsip_session.c
++++ b/res/res_pjsip_session.c
+@@ -33,6 +33,7 @@
+ #include "asterisk/res_pjsip_session.h"
+ #include "asterisk/res_pjsip_session_caps.h"
+ #include "asterisk/callerid.h"
++#include "asterisk/channel.h"
+ #include "asterisk/datastore.h"
+ #include "asterisk/module.h"
+ #include "asterisk/logger.h"
+@@ -1739,6 +1740,387 @@ static void set_from_header(struct ast_sip_session *session)
+     }
+ }
+ 
++/*
++ * Assuming struct hdr_list_entry and struct hdr_list are defined and accessible,
++ * typically from a shared header or by duplicating definitions from func_pjsip_header.c.
++ * A placeholder ifndef guard is used here for completeness if defined locally.
++ */
++#ifndef HDR_LIST_DEFINED_IN_RES_PJSIP_SESSION_C
++#define HDR_LIST_DEFINED_IN_RES_PJSIP_SESSION_C
++struct hdr_list_entry {
++	pjsip_hdr *hdr;
++	AST_LIST_ENTRY(hdr_list_entry) nextptr;
++};
++AST_LIST_HEAD_NOLOCK(hdr_list, hdr_list_entry);
++#endif
++
++// Datastore info; the 'type' must match the one used by PJSIP_HEADER()'s supplement.
++static const struct ast_datastore_info recovery_headers_datastore_info = {
++	.type = "header_datastore",
++};
++
++static void apply_pjsip_recovery_headers_init(struct ast_sip_session *session)
++{
++	pjsip_dialog *dlg;
++	pj_pool_t *pool_for_dialog_mods;
++	pj_pool_t *pool_for_datastore_items;
++	size_t len;
++
++	const char *val_from_display_c_str = NULL;
++	const char *val_from_uri_c_str = NULL;
++	const char *val_from_tag_c_str = NULL;
++	const char *val_to_display_c_str = NULL;
++	const char *val_to_uri_c_str = NULL;
++	const char *val_to_tag_c_str = NULL;
++	const char *val_call_id_c_str = NULL;
++	const char *val_cseq_c_str = NULL;
++	const char *val_routes_c_str = NULL;
++	const char *val_record_routes_c_str = NULL;
++
++	if (!session || !session->inv_session || !session->inv_session->dlg) {
++		ast_log(LOG_WARNING, "RECOVERY(INIT): Cannot apply headers: session, inv_session, or dialog is NULL for %s.\n",
++				session ? ast_sip_session_get_name(session) : "unknown session");
++		return;
++	}
++	dlg = session->inv_session->dlg;
++	pool_for_dialog_mods = dlg->pool;
++	pool_for_datastore_items = dlg->pool;
++
++	if (session->channel) {
++		val_from_display_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_FROM_DISPLAY");
++		val_from_uri_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_FROM_URI");
++		val_from_tag_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_FROM_TAG");
++		val_to_display_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_TO_DISPLAY");
++		val_to_uri_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_TO_URI");
++		val_to_tag_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_TO_TAG");
++		val_call_id_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_CALL-ID");
++		val_cseq_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_CSEQ");
++		val_routes_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_ROUTES");
++		val_record_routes_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_RECORD-ROUTES");
++		ast_channel_unlock(session->channel);
++
++		ast_log(LOG_DEBUG, "RECOVERY(INIT): Checking recovery variables. session: %s, from_display: %s, from_uri: %s, from_tag: %s, to_display: %s, to_uri: %s, to_tag: %s, call-id: %s, cseq: %s, routes: %s\n",
++				ast_sip_session_get_name(session),
++				val_from_display_c_str, val_from_uri_c_str, val_from_tag_c_str,
++				val_to_display_c_str, val_to_uri_c_str, val_to_tag_c_str,
++				val_call_id_c_str, val_cseq_c_str, val_routes_c_str);
++
++	} else {
++		ast_log(LOG_VERBOSE, "RECOVERY(INIT): No channel associated with session %s, cannot get recovery variables.\n", ast_sip_session_get_name(session));
++		return;
++	}
++
++
++	/* Phase 0: Store Route headers(Route, Record-Route) */
++	if (!ast_strlen_zero(val_record_routes_c_str)) {
++		char *routes_copy_for_datastore = ast_strdupa(val_record_routes_c_str);
++		char *current_route_token_ds;
++		char *saveptr_ds = NULL;
++
++		ast_log(LOG_VERBOSE, "RECOVERY(INIT): Storing PJSIP_RECOVERY_RECORD-ROUTES to datastore for session %s: '%s'\n",
++				ast_sip_session_get_name(session), val_record_routes_c_str);
++
++		for (current_route_token_ds = strtok_r(routes_copy_for_datastore, ",", &saveptr_ds);
++			 current_route_token_ds != NULL;
++			 current_route_token_ds = strtok_r(NULL, ",", &saveptr_ds)) {
++
++			char *trimmed_uri_str_ds = ast_strdupa(current_route_token_ds);
++
++			// Remove leading whitespace
++			char *trimmed_uri_str_ds_start = trimmed_uri_str_ds;
++			while (*trimmed_uri_str_ds_start == ' ') {
++				trimmed_uri_str_ds_start++;
++			}
++
++			//Remove trailing whitespace
++			ast_trim_blanks(trimmed_uri_str_ds_start);
++
++			if (ast_strlen_zero(trimmed_uri_str_ds_start)) {
++				continue;
++			}
++
++			RAII_VAR(struct ast_datastore *, datastore,
++					 ast_sip_session_get_datastore(session, recovery_headers_datastore_info.type), ao2_cleanup);
++
++			if (!datastore) {
++				datastore = ast_sip_session_alloc_datastore(&recovery_headers_datastore_info,
++															recovery_headers_datastore_info.type);
++				if (!datastore) {
++					ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate datastore for Record-Route header on session %s.\n", ast_sip_session_get_name(session));
++					continue;
++				}
++				datastore->data = pj_pool_alloc(pool_for_datastore_items, sizeof(struct hdr_list));
++				if (!datastore->data) {
++					ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate hdr_list for datastore on session %s.\n", ast_sip_session_get_name(session));
++					datastore = NULL;
++					continue;
++				}
++				if (ast_sip_session_add_datastore(session, datastore)) {
++					ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to add datastore to session %s for Record-Route header.\n", ast_sip_session_get_name(session));
++					datastore = NULL;
++					continue;
++				}
++				AST_LIST_HEAD_INIT_NOLOCK((struct hdr_list *) datastore->data);
++			} else {
++				if (!datastore->data) {
++					datastore->data = pj_pool_alloc(pool_for_datastore_items, sizeof(struct hdr_list));
++					if (!datastore->data) {
++						ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate hdr_list for existing datastore on session %s.\n", ast_sip_session_get_name(session));
++						continue;
++					}
++					AST_LIST_HEAD_INIT_NOLOCK((struct hdr_list *) datastore->data);
++				}
++			}
++
++			pj_str_t pj_header_name_route;
++			pj_str_t pj_header_value_route;
++			struct hdr_list_entry *le;
++			struct hdr_list *list = (struct hdr_list *) datastore->data;
++			char route_val_buffer[PJSIP_MAX_URL_SIZE + 3]; /* For "<", ">", and null terminator */
++
++			pj_cstr(&pj_header_name_route, "Record-Route");
++
++			if (trimmed_uri_str_ds_start[0] != '<' && strchr(trimmed_uri_str_ds_start, ':')) {
++				snprintf(route_val_buffer, sizeof(route_val_buffer), "<%s>", trimmed_uri_str_ds_start);
++				pj_cstr(&pj_header_value_route, route_val_buffer);
++			} else {
++				pj_cstr(&pj_header_value_route, trimmed_uri_str_ds_start);
++			}
++
++			le = pj_pool_zalloc(pool_for_datastore_items, sizeof(struct hdr_list_entry));
++			if (!le) { /* pj_pool_zalloc failed */
++				ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate hdr_list_entry for Record-Route on session %s.\n", ast_sip_session_get_name(session));
++				continue;
++			}
++			le->hdr = (pjsip_hdr *) pjsip_generic_string_hdr_create(pool_for_datastore_items, &pj_header_name_route, &pj_header_value_route);
++			if (!le->hdr) { /* pjsip_generic_string_hdr_create failed */
++				ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to create generic_string_hdr for Record-Route '%.*s' on session %s.\n",
++						(int)pj_header_value_route.slen, pj_header_value_route.ptr, ast_sip_session_get_name(session));
++				continue;
++			}
++
++			AST_LIST_INSERT_TAIL(list, le, nextptr);
++			ast_log(LOG_NOTICE, "RECOVERY(INIT): Stored 'Record-Route: %.*s' to datastore for session %s.\n",
++					(int)pj_header_value_route.slen, pj_header_value_route.ptr, ast_sip_session_get_name(session));
++		}
++	}
++
++	if (!ast_strlen_zero(val_routes_c_str)) {
++		char *routes_copy_for_datastore = ast_strdupa(val_routes_c_str);
++		char *current_route_token;
++		char *saveptr = NULL;
++		pjsip_route_hdr route_set;
++		static const pj_str_t ROUTE_HNAME = { "Route", 5 };
++		pj_str_t tmp;
++
++		ast_log(LOG_VERBOSE, "RECOVERY(INIT): Storing PJSIP_RECOVERY_ROUTES to datastore for session %s: '%s'\n",
++				ast_sip_session_get_name(session), val_routes_c_str);
++
++		pj_list_init(&route_set);
++		for (current_route_token = strtok_r(routes_copy_for_datastore, ",", &saveptr);
++			 current_route_token != NULL;
++			 current_route_token = strtok_r(NULL, ",", &saveptr)) {
++
++			char *trimmed_uri_str = ast_strdupa(current_route_token);
++
++			// Remove leading whitespace
++			char *trimmed_uri_str_start = trimmed_uri_str;
++			while (*trimmed_uri_str_start == ' ') {
++				trimmed_uri_str_start++;
++			}
++
++			//Remove trailing whitespace
++			ast_trim_blanks(trimmed_uri_str_start);
++
++			if (ast_strlen_zero(trimmed_uri_str_start)) {
++				continue;
++			}
++
++			pj_strdup2_with_null(pool_for_dialog_mods, &tmp, trimmed_uri_str_start);
++			pjsip_route_hdr *route = pjsip_parse_hdr(pool_for_dialog_mods, &ROUTE_HNAME, tmp.ptr, tmp.slen, NULL);
++			if (!route) {
++				ast_log(LOG_ERROR, "Could not create route header for URI '%s'\n", trimmed_uri_str_start);
++				continue;
++			}
++
++			pj_list_insert_before(&route_set, route);
++			ast_log(LOG_NOTICE, "RECOVERY(INIT): Storing 'Route: %s' to datastore for session %s.\n",
++					trimmed_uri_str_start, ast_sip_session_get_name(session));
++		}
++
++		// Finally set the route set
++		pjsip_dlg_set_route_set(dlg, &route_set);
++		ast_log(LOG_NOTICE, "RECOVERY(INIT): Route set applied to dialog for session %s.\n", ast_sip_session_get_name(session));
++	}
++
++	/* Phase 1: Modify Dialog Properties (Call-ID, From, To, CSeq) */
++	ast_log(LOG_VERBOSE, "RECOVERY(INIT): Phase 1: Modifying DIALOG properties for session %s.\n", ast_sip_session_get_name(session));
++
++	if (dlg->call_id && !ast_strlen_zero(val_call_id_c_str)) {
++		len = strlen(val_call_id_c_str);
++		dlg->call_id->id.ptr = pj_pool_alloc(pool_for_dialog_mods, len + 1);
++		if (dlg->call_id->id.ptr) {
++			pj_memcpy(dlg->call_id->id.ptr, val_call_id_c_str, len);
++			((char*)dlg->call_id->id.ptr)[len] = '\0';
++			dlg->call_id->id.slen = len;
++			ast_log(LOG_NOTICE, "RECOVERY: DIALOG Call-ID SET to: %.*s for session %s.\n",
++				(int)dlg->call_id->id.slen, dlg->call_id->id.ptr, ast_sip_session_get_name(session));
++		} else {
++			ast_log(LOG_ERROR, "RECOVERY: Failed to allocate memory for DIALOG Call-ID for session %s.\n", ast_sip_session_get_name(session));
++			if(dlg->call_id) dlg->call_id->id.slen = 0;
++		}
++	}
++
++	if (dlg->local.info && !ast_strlen_zero(val_from_uri_c_str)) {
++		pjsip_uri *parsed_uri;
++		char *mutable_uri_c_str = pj_pool_alloc(pool_for_dialog_mods, strlen(val_from_uri_c_str) + 1);
++		if (mutable_uri_c_str) {
++			strcpy(mutable_uri_c_str, val_from_uri_c_str);
++			parsed_uri = pjsip_parse_uri(pool_for_dialog_mods, mutable_uri_c_str, strlen(mutable_uri_c_str), 0);
++			if (parsed_uri && (PJSIP_URI_SCHEME_IS_SIP(parsed_uri) || PJSIP_URI_SCHEME_IS_SIPS(parsed_uri))) {
++				pjsip_name_addr *name_addr = NULL;
++				if (dlg->local.info->uri && pjsip_uri_get_uri(dlg->local.info->uri) != dlg->local.info->uri ) {
++					name_addr = (pjsip_name_addr*)dlg->local.info->uri;
++				} else {
++					name_addr = pjsip_name_addr_create(pool_for_dialog_mods);
++					if (name_addr) dlg->local.info->uri = (pjsip_uri*)name_addr;
++					else { ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to create name_addr for DIALOG From for session %s.\n", ast_sip_session_get_name(session)); goto p1_from_cleanup; }
++				}
++				name_addr->uri = pjsip_uri_clone(pool_for_dialog_mods, parsed_uri);
++				if (!name_addr->uri) { ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to clone From URI for DIALOG for session %s.\n", ast_sip_session_get_name(session)); goto p1_from_cleanup; }
++
++				if (!ast_strlen_zero(val_from_display_c_str)) {
++					len = strlen(val_from_display_c_str); name_addr->display.ptr = pj_pool_alloc(pool_for_dialog_mods, len+1);
++					if(name_addr->display.ptr) { pj_memcpy(name_addr->display.ptr, val_from_display_c_str, len); ((char*)name_addr->display.ptr)[len]='\0'; name_addr->display.slen=len; }
++					else { name_addr->display.slen=0; }
++				} else {
++					name_addr->display.ptr = NULL; name_addr->display.slen = 0;
++				}
++				if (!ast_strlen_zero(val_from_tag_c_str)) {
++					len = strlen(val_from_tag_c_str); dlg->local.info->tag.ptr = pj_pool_alloc(pool_for_dialog_mods, len+1);
++					if(dlg->local.info->tag.ptr) { pj_memcpy(dlg->local.info->tag.ptr, val_from_tag_c_str, len); ((char*)dlg->local.info->tag.ptr)[len]='\0'; dlg->local.info->tag.slen=len; }
++					else { dlg->local.info->tag.slen=0;}
++				}
++				ast_log(LOG_NOTICE, "RECOVERY(INIT): DIALOG From URI/Display/Tag updated for session %s.\n", ast_sip_session_get_name(session));
++			} else {
++				 ast_log(LOG_WARNING, "RECOVERY(INIT): Failed to parse DIALOG PJSIP_RECOVERY_FROM_URI '%s' for session %s.\n", val_from_uri_c_str, ast_sip_session_get_name(session));
++			}
++		} else {
++			ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate for From URI parsing buffer for session %s.\n", ast_sip_session_get_name(session));
++		}
++p1_from_cleanup:;
++	}
++
++	if (dlg->remote.info && !ast_strlen_zero(val_to_uri_c_str)) {
++		pjsip_uri *parsed_uri;
++		char *mutable_uri_c_str = pj_pool_alloc(pool_for_dialog_mods, strlen(val_to_uri_c_str) + 1);
++		if(mutable_uri_c_str){
++			strcpy(mutable_uri_c_str, val_to_uri_c_str);
++			parsed_uri = pjsip_parse_uri(pool_for_dialog_mods, mutable_uri_c_str, strlen(mutable_uri_c_str), 0);
++			if (parsed_uri && (PJSIP_URI_SCHEME_IS_SIP(parsed_uri) || PJSIP_URI_SCHEME_IS_SIPS(parsed_uri))) {
++				pjsip_name_addr *name_addr = NULL;
++				if (dlg->remote.info->uri && pjsip_uri_get_uri(dlg->remote.info->uri) != dlg->remote.info->uri ) {
++					name_addr = (pjsip_name_addr*)dlg->remote.info->uri;
++				} else {
++					name_addr = pjsip_name_addr_create(pool_for_dialog_mods);
++					if (name_addr) dlg->remote.info->uri = (pjsip_uri*)name_addr;
++					else { ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to create name_addr for DIALOG To for session %s.\n", ast_sip_session_get_name(session)); goto p1_to_cleanup; }
++				}
++				name_addr->uri = pjsip_uri_clone(pool_for_dialog_mods, parsed_uri);
++				if (!name_addr->uri) { ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to clone To URI for DIALOG for session %s.\n", ast_sip_session_get_name(session)); goto p1_to_cleanup; }
++
++				if (!ast_strlen_zero(val_to_display_c_str)) {
++					len = strlen(val_to_display_c_str); name_addr->display.ptr = pj_pool_alloc(pool_for_dialog_mods, len+1);
++					if(name_addr->display.ptr) { pj_memcpy(name_addr->display.ptr, val_to_display_c_str, len); ((char*)name_addr->display.ptr)[len]='\0'; name_addr->display.slen=len; }
++					else {name_addr->display.slen=0;}
++				} else {
++					name_addr->display.ptr = NULL; name_addr->display.slen = 0;
++				}
++				if (!ast_strlen_zero(val_to_tag_c_str)) {
++					len = strlen(val_to_tag_c_str); dlg->remote.info->tag.ptr = pj_pool_alloc(pool_for_dialog_mods, len+1);
++					if(dlg->remote.info->tag.ptr) { pj_memcpy(dlg->remote.info->tag.ptr, val_to_tag_c_str, len); ((char*)dlg->remote.info->tag.ptr)[len]='\0'; dlg->remote.info->tag.slen=len; }
++					else {dlg->remote.info->tag.slen=0;}
++				} else {
++					dlg->remote.info->tag.ptr = NULL; dlg->remote.info->tag.slen = 0;
++				}
++				ast_log(LOG_NOTICE, "RECOVERY(INIT): DIALOG To URI/Display/Tag updated for session %s.\n", ast_sip_session_get_name(session));
++			} else {
++				ast_log(LOG_WARNING, "RECOVERY(INIT): Failed to parse DIALOG PJSIP_RECOVERY_TO_URI '%s' for session %s.\n", val_to_uri_c_str, ast_sip_session_get_name(session));
++			}
++		} else {
++			ast_log(LOG_ERROR, "RECOVERY(INIT): Failed to allocate for To URI parsing buffer for session %s.\n", ast_sip_session_get_name(session));
++		}
++p1_to_cleanup:;
++	}
++
++	if (!ast_strlen_zero(val_cseq_c_str)) {
++		long cseq_num_val_for_dialog = strtol(val_cseq_c_str, NULL, 10);
++		if (cseq_num_val_for_dialog > 0) {
++			dlg->local.first_cseq = cseq_num_val_for_dialog;
++			dlg->local.cseq = cseq_num_val_for_dialog;
++			ast_log(LOG_NOTICE, "RECOVERY(INIT): DIALOG local.cseq SET to: %u from '%s' for session %s.\n",
++					dlg->local.cseq, val_cseq_c_str, ast_sip_session_get_name(session));
++		} else {
++			ast_log(LOG_WARNING, "RECOVERY(INIT): Failed to parse CSeq for DIALOG from PJSIP_RECOVERY_CSEQ '%s' for session %s.\n",
++					val_cseq_c_str, ast_sip_session_get_name(session));
++		}
++	}
++	ast_log(LOG_VERBOSE, "RECOVERY(INIT): Phase 1: Finished DIALOG property modifications for session %s.\n", ast_sip_session_get_name(session));
++}
++
++
++static void apply_pjsip_recovery_headers_others(struct ast_sip_session *session, pjsip_tx_data *tdata_for_msg_mods_only)
++{
++	pjsip_msg *msg_ptr;
++	pj_pool_t *pool_for_message_mods;
++
++	const char *val_request_uri_c_str = NULL;
++
++	if (!session || !tdata_for_msg_mods_only || !tdata_for_msg_mods_only->msg) {
++		return;
++	}
++
++	if (session->channel) {
++		val_request_uri_c_str = pbx_builtin_getvar_helper(session->channel, "PJSIP_RECOVERY_REQUEST_URI");
++		ast_channel_unlock(session->channel);
++
++		ast_log(LOG_DEBUG, "RECOVERY(OTHERS): Checking recovery variables. session: %s, request_uri: %s\n",
++				ast_sip_session_get_name(session), val_request_uri_c_str);
++	} else {
++		ast_log(LOG_VERBOSE, "RECOVERY(OTHERS): No channel associated with session %s, cannot get recovery variables.\n", ast_sip_session_get_name(session));
++		return;
++	}
++
++	msg_ptr = tdata_for_msg_mods_only->msg;
++	pool_for_message_mods = tdata_for_msg_mods_only->pool;
++
++	ast_log(LOG_VERBOSE, "RECOVERY(OTHERS): Phase 2: Modifying MESSAGE properties for session %s.\n", ast_sip_session_get_name(session));
++
++	/* Phase 2: Modify Message Specific Headers (Request-URI, CSeq) */
++	if (!ast_strlen_zero(val_request_uri_c_str)) {
++		pjsip_uri *parsed_req_uri = NULL;
++		char* mutable_req_uri_for_parse = pj_pool_alloc(pool_for_message_mods, strlen(val_request_uri_c_str) + 1);
++		if (mutable_req_uri_for_parse) {
++			strcpy(mutable_req_uri_for_parse, val_request_uri_c_str);
++			parsed_req_uri = pjsip_parse_uri(pool_for_message_mods, mutable_req_uri_for_parse, strlen(mutable_req_uri_for_parse), 0);
++			if (parsed_req_uri) {
++				msg_ptr->line.req.uri = pjsip_uri_clone(pool_for_message_mods, parsed_req_uri);
++				if (msg_ptr->line.req.uri) {
++					ast_log(LOG_NOTICE, "RECOVERY(OTHERS): Message Request-URI OVERRIDDEN for session %s.\n", ast_sip_session_get_name(session));
++				} else {
++					ast_log(LOG_ERROR, "RECOVERY(OTHERS): Failed to clone parsed Request-URI for message for session %s.\n", ast_sip_session_get_name(session));
++				}
++			} else {
++				ast_log(LOG_WARNING, "RECOVERY(OTHERS): Failed to parse PJSIP_RECOVERY_REQUEST_URI '%s' for message for session %s.\n", val_request_uri_c_str, ast_sip_session_get_name(session));
++			}
++		} else {
++			ast_log(LOG_ERROR, "RECOVERY(OTHERS): Failed to allocate for message Request-URI parsing for session %s.\n", ast_sip_session_get_name(session));
++		}
++	}
++
++	ast_log(LOG_VERBOSE, "RECOVERY(OTHERS): Phase 2: Finished MESSAGE property modifications for session %s.\n", ast_sip_session_get_name(session));
++}
++
+ /*
+  * Helper macros for merging and validating media states
+  */
+@@ -2869,6 +3251,7 @@ int ast_sip_session_create_invite(struct ast_sip_session *session, pjsip_tx_data
+ 	pjmedia_sdp_session *offer;
+ 	SCOPE_ENTER(1, "%s\n", ast_sip_session_get_name(session));
+ 
++
+ 	if (!(offer = create_local_sdp(session->inv_session, session, NULL, 0))) {
+ 		pjsip_inv_terminate(session->inv_session, 500, PJ_FALSE);
+ 		SCOPE_EXIT_RTN_VALUE(-1, "Couldn't create offer\n");
+@@ -2888,10 +3271,25 @@ int ast_sip_session_create_invite(struct ast_sip_session *session, pjsip_tx_data
+ 	 */
+ 	set_from_header(session);
+ 
++	apply_pjsip_recovery_headers_init(session);
++
++	ast_log(LOG_NOTICE, "%s: [RECOVERY_DEBUG] About to call pjsip_inv_invite. Dialog state: %d\n",
++            ast_sip_session_get_name(session), session && session->inv_session && session->inv_session->dlg ? session->inv_session->dlg->state : -1);
++
+ 	if (pjsip_inv_invite(session->inv_session, tdata) != PJ_SUCCESS) {
++		pjsip_inv_terminate(session->inv_session, 500, PJ_FALSE);
+ 		SCOPE_EXIT_RTN_VALUE(-1, "pjsip_inv_invite failed\n");
+ 	}
+ 
++    ast_log(LOG_NOTICE, "%s: [RECOVERY_DEBUG] pjsip_inv_invite successful. tdata: %p\n",
++            ast_sip_session_get_name(session), (void*)*tdata);
++
++	if (*tdata) {
++		apply_pjsip_recovery_headers_others(session, *tdata);
++	} else {
++		ast_log(LOG_ERROR, "%s: [RECOVERY] tdata is NULL after pjsip_inv_invite, cannot apply message-specific recovery headers.\n", ast_sip_session_get_name(session));
++	}
++
+ 	SCOPE_EXIT_RTN_VALUE(0);
+ }
+ 
